@@ -1,4 +1,4 @@
-from .utils import Standalone, Update, Setup, Alias
+from .utils import Standalone, Update, Setup, Alias, run_electron_app
 import argparse
 import sys
 import os
@@ -16,8 +16,8 @@ def main():
         "--copy", "-C", help="Copy the response to the clipboard", action="store_true"
     )
     parser.add_argument(
-        '--agents', '-a', choices=['trip_planner', 'ApiKeys'],
-        help="Use an AI agent to help you with a task. Acceptable values are 'trip_planner' or 'ApiKeys'. This option cannot be used with any other flag."
+        '--agents', '-a',
+        help="Use praisonAI to create an AI agent and then use it. ex: 'write me a movie script'", action="store_true"
     )
 
     parser.add_argument(
@@ -28,6 +28,15 @@ def main():
         const="analyzepaper.txt",
         default=None,
     )
+    parser.add_argument('--session', '-S',
+                        help="Continue your previous conversation. Default is your previous conversation", nargs="?", const="default")
+    parser.add_argument(
+        '--clearsession', help="deletes indicated session. Use 'all' to delete all sessions")
+    parser.add_argument('--sessionlog', help="View the log of a session")
+    parser.add_argument(
+        '--listsessions', help="List all sessions", action="store_true")
+    parser.add_argument(
+        "--gui", help="Use the GUI (Node and npm need to be installed)", action="store_true")
     parser.add_argument(
         "--stream",
         "-s",
@@ -38,6 +47,14 @@ def main():
         "--list", "-l", help="List available patterns", action="store_true"
     )
     parser.add_argument(
+        '--temp', help="set the temperature for the model. Default is 0", default=0, type=float)
+    parser.add_argument(
+        '--top_p', help="set the top_p for the model. Default is 1", default=1, type=float)
+    parser.add_argument(
+        '--frequency_penalty', help="set the frequency penalty for the model. Default is 0.1", default=0.1, type=float)
+    parser.add_argument(
+        '--presence_penalty', help="set the presence penalty for the model. Default is 0.1", default=0.1, type=float)
+    parser.add_argument(
         "--update", "-u", help="Update patterns. NOTE: This will revert the default model to gpt4-turbo. please run --changeDefaultModel to once again set default model", action="store_true")
     parser.add_argument("--pattern", "-p", help="The pattern (prompt) to use")
     parser.add_argument(
@@ -47,13 +64,13 @@ def main():
                         help="Change the default model. For a list of available models, use the --listmodels flag.")
 
     parser.add_argument(
-        "--model", "-m", help="Select the model to use. NOTE: Will not work if you have set a default model. please use --clear to clear persistence before using this flag"
+        "--model", "-m", help="Select the model to use"
     )
     parser.add_argument(
         "--listmodels", help="List all available models", action="store_true"
     )
     parser.add_argument('--remoteOllamaServer',
-                        help='The URL of the remote ollamaserver to use. ONLY USE THIS if you are using a local ollama server in an non-deault location or port')
+                        help='The URL of the remote ollamaserver to use. ONLY USE THIS if you are using a local ollama server in an non-default location or port')
     parser.add_argument('--context', '-c',
                         help="Use Context file (context.md) to add context to your pattern", action="store_true")
 
@@ -79,17 +96,9 @@ def main():
     if args.changeDefaultModel:
         Setup().default_model(args.changeDefaultModel)
         sys.exit()
-    if args.agents:
-        # Handle the agents logic
-        if args.agents == 'trip_planner':
-            from .agents.trip_planner.main import planner_cli
-            tripcrew = planner_cli()
-            tripcrew.ask()
-            sys.exit()
-        elif args.agents == 'ApiKeys':
-            from .utils import AgentSetup
-            AgentSetup().run()
-            sys.exit()
+    if args.gui:
+        run_electron_app()
+        sys.exit()
     if args.update:
         Update()
         Alias()
@@ -98,6 +107,46 @@ def main():
         if not os.path.exists(os.path.join(config, "context.md")):
             print("Please create a context.md file in ~/.config/fabric")
             sys.exit()
+    if args.agents:
+        standalone = Standalone(args)
+        text = ""  # Initialize text variable
+        # Check if an argument was provided to --agents
+        if args.text:
+            text = args.text
+        else:
+            text = standalone.get_cli_input()
+        if text:
+            standalone = Standalone(args)
+            standalone.agents(text)
+            sys.exit()
+    if args.session:
+        from .helper import Session
+        session = Session()
+        if args.session == "default":
+            session_file = session.find_most_recent_file()
+            if session_file is None:
+                args.session = "default"
+            else:
+                args.session = session_file.split("/")[-1]
+    if args.clearsession:
+        from .helper import Session
+        session = Session()
+        session.clear_session(args.clearsession)
+        if args.clearsession == "all":
+            print(f"All sessions cleared")
+        else:
+            print(f"Session {args.clearsession} cleared")
+        sys.exit()
+    if args.sessionlog:
+        from .helper import Session
+        session = Session()
+        print(session.session_log(args.sessionlog))
+        sys.exit()
+    if args.listsessions:
+        from .helper import Session
+        session = Session()
+        session.list_sessions()
+        sys.exit()
     standalone = Standalone(args, args.pattern)
     if args.list:
         try:
@@ -109,7 +158,7 @@ def main():
             print("No patterns found")
             sys.exit()
     if args.listmodels:
-        gptmodels, localmodels, claudemodels = standalone.fetch_available_models()
+        gptmodels, localmodels, claudemodels, googlemodels = standalone.fetch_available_models()
         print("GPT Models:")
         for model in gptmodels:
             print(model)
@@ -118,6 +167,9 @@ def main():
             print(model)
         print("\nClaude Models:")
         for model in claudemodels:
+            print(model)
+        print("\nGoogle Models:")
+        for model in googlemodels:
             print(model)
         sys.exit()
     if args.text is not None:

@@ -8,8 +8,9 @@ import platform
 from dotenv import load_dotenv
 import zipfile
 import tempfile
-import re
+import subprocess
 import shutil
+from youtube_transcript_api import YouTubeTranscriptApi
 
 current_directory = os.path.dirname(os.path.realpath(__file__))
 config_directory = os.path.expanduser("~/.config/fabric")
@@ -37,12 +38,11 @@ class Standalone:
         if args is None:
             args = type('Args', (), {})()
         env_file = os.path.expanduser(env_file)
+        self.client = None
         load_dotenv(env_file)
-        assert 'OPENAI_API_KEY' in os.environ, "Error: OPENAI_API_KEY not found in environment variables. Please run fabric --setup and add a key."
-        api_key = os.environ['OPENAI_API_KEY']
-        base_url = os.environ.get(
-            'OPENAI_BASE_URL', 'https://api.openai.com/v1/')
-        self.client = OpenAI(api_key=api_key, base_url=base_url)
+        if "OPENAI_API_KEY" in os.environ:
+            api_key = os.environ['OPENAI_API_KEY']
+            self.client = OpenAI(api_key=api_key)
         self.local = False
         self.config_pattern_directory = config_directory
         self.pattern = pattern
@@ -53,62 +53,139 @@ class Standalone:
             if not self.model:
                 self.model = 'gpt-4-turbo-preview'
         self.claude = False
-        sorted_gpt_models, ollamaList, claudeList = self.fetch_available_models()
+        sorted_gpt_models, ollamaList, claudeList, googleList = self.fetch_available_models()
+        self.sorted_gpt_models = sorted_gpt_models
+        self.ollamaList = ollamaList
+        self.claudeList = claudeList
+        self.googleList = googleList
         self.local = self.model in ollamaList
         self.claude = self.model in claudeList
+        self.google = self.model in googleList
 
     async def localChat(self, messages, host=''):
         from ollama import AsyncClient
         response = None
         if host:
-            response = await AsyncClient(host=host).chat(model=self.model, messages=messages, host=host)
+            response = await AsyncClient(host=host).chat(model=self.model, messages=messages)
         else:
             response = await AsyncClient().chat(model=self.model, messages=messages)
         print(response['message']['content'])
         copy = self.args.copy
         if copy:
             pyperclip.copy(response['message']['content'])
+        if self.args.output:
+            with open(self.args.output, "w") as f:
+                f.write(response['message']['content'])
 
     async def localStream(self, messages, host=''):
         from ollama import AsyncClient
+        buffer = ""
         if host:
-            async for part in await AsyncClient(host=host).chat(model=self.model, messages=messages, stream=True, host=host):
+            async for part in await AsyncClient(host=host).chat(model=self.model, messages=messages, stream=True):
+                buffer += part['message']['content']
                 print(part['message']['content'], end='', flush=True)
         else:
             async for part in await AsyncClient().chat(model=self.model, messages=messages, stream=True):
+                buffer += part['message']['content']
                 print(part['message']['content'], end='', flush=True)
+        if self.args.output:
+            with open(self.args.output, "w") as f:
+                f.write(buffer)
+        if self.args.copy:
+            pyperclip.copy(buffer)
 
     async def claudeStream(self, system, user):
         from anthropic import AsyncAnthropic
         self.claudeApiKey = os.environ["CLAUDE_API_KEY"]
         Streamingclient = AsyncAnthropic(api_key=self.claudeApiKey)
+        buffer = ""
         async with Streamingclient.messages.stream(
             max_tokens=4096,
             system=system,
             messages=[user],
-            model=self.model, temperature=0.0, top_p=1.0
+            model=self.model, temperature=self.args.temp, top_p=self.args.top_p
         ) as stream:
             async for text in stream.text_stream:
+                buffer += text
                 print(text, end="", flush=True)
             print()
-
+        if self.args.copy:
+            pyperclip.copy(buffer)
+        if self.args.output:
+            with open(self.args.output, "w") as f:
+                f.write(buffer)
+        if self.args.session:
+            from .helper import Session
+            session = Session()
+            session.save_to_session(
+                system, user, buffer, self.args.session)
         message = await stream.get_final_message()
 
     async def claudeChat(self, system, user, copy=False):
         from anthropic import Anthropic
         self.claudeApiKey = os.environ["CLAUDE_API_KEY"]
         client = Anthropic(api_key=self.claudeApiKey)
+        message = None
         message = client.messages.create(
             max_tokens=4096,
             system=system,
             messages=[user],
             model=self.model,
-            temperature=0.0, top_p=1.0
+            temperature=self.args.temp, top_p=self.args.top_p
         )
         print(message.content[0].text)
         copy = self.args.copy
         if copy:
             pyperclip.copy(message.content[0].text)
+        if self.args.output:
+            with open(self.args.output, "w") as f:
+                f.write(message.content[0].text)
+        if self.args.session:
+            from .helper import Session
+            session = Session()
+            session.save_to_session(
+                system, user, message.content[0].text, self.args.session)
+
+    async def googleChat(self, system, user, copy=False):
+        import google.generativeai as genai
+        self.googleApiKey = os.environ["GOOGLE_API_KEY"]
+        genai.configure(api_key=self.googleApiKey)
+        model = genai.GenerativeModel(
+            model_name=self.model, system_instruction=system)
+        response = model.generate_content(user)
+        print(response.text)
+        if copy:
+            pyperclip.copy(response.text)
+        if self.args.output:
+            with open(self.args.output, "w") as f:
+                f.write(response.text)
+        if self.args.session:
+            from .helper import Session
+            session = Session()
+            session.save_to_session(
+                system, user, response.text, self.args.session)
+
+    async def googleStream(self, system, user, copy=False):
+        import google.generativeai as genai
+        buffer = ""
+        self.googleApiKey = os.environ["GOOGLE_API_KEY"]
+        genai.configure(api_key=self.googleApiKey)
+        model = genai.GenerativeModel(
+            model_name=self.model, system_instruction=system)
+        response = model.generate_content(user, stream=True)
+        for chunk in response:
+            buffer += chunk.text
+            print(chunk.text)
+        if copy:
+            pyperclip.copy(buffer)
+        if self.args.output:
+            with open(self.args.output, "w") as f:
+                f.write(buffer)
+        if self.args.session:
+            from .helper import Session
+            session = Session()
+            session.save_to_session(
+                system, user, buffer, self.args.session)
 
     def streamMessage(self, input_data: str, context="", host=''):
         """        Stream a message and handle exceptions.
@@ -126,23 +203,41 @@ class Standalone:
         wisdomFilePath = os.path.join(
             config_directory, f"patterns/{self.pattern}/system.md"
         )
+        session_message = ""
+        user = ""
+        if self.args.session:
+            from .helper import Session
+            session = Session()
+            session_message = session.read_from_session(
+                self.args.session)
+        if session_message:
+            user = session_message + '\n' + input_data
+        else:
+            user = input_data
         user_message = {"role": "user", "content": f"{input_data}"}
-        wisdom_File = os.path.join(current_directory, wisdomFilePath)
-        system = ""
+        wisdom_File = wisdomFilePath
         buffer = ""
+        system = ""
         if self.pattern:
             try:
                 with open(wisdom_File, "r") as f:
                     if context:
                         system = context + '\n\n' + f.read()
+                        if session_message:
+                            system = session_message + '\n' + system
                     else:
                         system = f.read()
+                        if session_message:
+                            system = session_message + '\n' + system
                     system_message = {"role": "system", "content": system}
                 messages = [system_message, user_message]
             except FileNotFoundError:
                 print("pattern not found")
                 return
         else:
+            if session_message:
+                user_message['content'] = session_message + \
+                    '\n' + user_message['content']
             if context:
                 messages = [
                     {"role": "system", "content": context}, user_message]
@@ -157,14 +252,18 @@ class Standalone:
             elif self.claude:
                 from anthropic import AsyncAnthropic
                 asyncio.run(self.claudeStream(system, user_message))
+            elif self.google:
+                if system == "":
+                    system = " "
+                asyncio.run(self.googleStream(system, user_message['content']))
             else:
                 stream = self.client.chat.completions.create(
                     model=self.model,
                     messages=messages,
-                    temperature=0.0,
-                    top_p=1,
-                    frequency_penalty=0.1,
-                    presence_penalty=0.1,
+                    temperature=self.args.temp,
+                    top_p=self.args.top_p,
+                    frequency_penalty=self.args.frequency_penalty,
+                    presence_penalty=self.args.presence_penalty,
                     stream=True,
                 )
                 for chunk in stream:
@@ -196,6 +295,11 @@ class Standalone:
         if self.args.output:
             with open(self.args.output, "w") as f:
                 f.write(buffer)
+        if self.args.session:
+            from .helper import Session
+            session = Session()
+            session.save_to_session(
+                system, user, buffer, self.args.session)
 
     def sendMessage(self, input_data: str, context="", host=''):
         """        Send a message using the input data and generate a response.
@@ -213,22 +317,38 @@ class Standalone:
         wisdomFilePath = os.path.join(
             config_directory, f"patterns/{self.pattern}/system.md"
         )
+        user = input_data
         user_message = {"role": "user", "content": f"{input_data}"}
         wisdom_File = os.path.join(current_directory, wisdomFilePath)
         system = ""
+        session_message = ""
+        if self.args.session:
+            from .helper import Session
+            session = Session()
+            session_message = session.read_from_session(
+                self.args.session)
         if self.pattern:
             try:
                 with open(wisdom_File, "r") as f:
                     if context:
-                        system = context + '\n\n' + f.read()
+                        if session_message:
+                            system = session_message + '\n' + context + '\n\n' + f.read()
+                        else:
+                            system = context + '\n\n' + f.read()
                     else:
-                        system = f.read()
+                        if session_message:
+                            system = session_message + '\n' + f.read()
+                        else:
+                            system = f.read()
                     system_message = {"role": "system", "content": system}
                 messages = [system_message, user_message]
             except FileNotFoundError:
                 print("pattern not found")
                 return
         else:
+            if session_message:
+                user_message['content'] = session_message + \
+                    '\n' + user_message['content']
             if context:
                 messages = [
                     {'role': 'system', 'content': context}, user_message]
@@ -242,14 +362,18 @@ class Standalone:
                     asyncio.run(self.localChat(messages))
             elif self.claude:
                 asyncio.run(self.claudeChat(system, user_message))
+            elif self.google:
+                if system == "":
+                    system = " "
+                asyncio.run(self.googleChat(system, user_message['content']))
             else:
                 response = self.client.chat.completions.create(
                     model=self.model,
                     messages=messages,
-                    temperature=0.0,
-                    top_p=1,
-                    frequency_penalty=0.1,
-                    presence_penalty=0.1,
+                    temperature=self.args.temp,
+                    top_p=self.args.top_p,
+                    frequency_penalty=self.args.frequency_penalty,
+                    presence_penalty=self.args.presence_penalty,
                 )
                 print(response.choices[0].message.content)
                 if self.args.copy:
@@ -257,6 +381,11 @@ class Standalone:
                 if self.args.output:
                     with open(self.args.output, "w") as f:
                         f.write(response.choices[0].message.content)
+                if self.args.session:
+                    from .helper import Session
+                    session = Session()
+                    session.save_to_session(
+                        system, user, response.choices[0], self.args.session)
         except Exception as e:
             if "All connection attempts failed" in str(e):
                 print(
@@ -276,41 +405,52 @@ class Standalone:
     def fetch_available_models(self):
         gptlist = []
         fullOllamaList = []
-        claudeList = ['claude-3-opus-20240229',
-                      'claude-3-sonnet-20240229',
-                      'claude-3-haiku-20240307',
-                      'claude-2.1']
-        try:
-            models = [model.id.strip()
-                      for model in self.client.models.list().data]
-        except APIConnectionError as e:
-            if getattr(e.__cause__, 'args', [''])[0] == "Illegal header value b'Bearer '":
-                print("Error: Cannot connect to the OpenAI API Server because the API key is not set. Please run fabric --setup and add a key.")
+        googleList = []
+        if "CLAUDE_API_KEY" in os.environ:
+            claudeList = ['claude-3-opus-20240229', 'claude-3-sonnet-20240229',
+                          'claude-3-haiku-20240307', 'claude-2.1']
+        else:
+            claudeList = []
 
-            else:
-                print(
-                    f"Error: {e.message} trying to access {e.request.url}: {getattr(e.__cause__, 'args', [''])}")
-            sys.exit()
+        try:
+            if self.client:
+                models = [model.id.strip()
+                          for model in self.client.models.list().data]
+                if "/" in models[0] or "\\" in models[0]:
+                    gptlist = [item[item.rfind(
+                        "/") + 1:] if "/" in item else item[item.rfind("\\") + 1:] for item in models]
+                else:
+                    gptlist = [item.strip()
+                               for item in models if item.startswith("gpt")]
+                gptlist.sort()
+        except APIConnectionError as e:
+            pass
         except Exception as e:
             print(f"Error: {getattr(e.__context__, 'args', [''])[0]}")
             sys.exit()
-        if "/" in models[0] or "\\" in models[0]:
-            # lmstudio returns full paths to models. Iterate and truncate everything before and including the last slash
-            gptlist = [item[item.rfind(
-                "/") + 1:] if "/" in item else item[item.rfind("\\") + 1:] for item in models]
-        else:
-            # Keep items that start with "gpt"
-            gptlist = [item.strip()
-                       for item in models if item.startswith("gpt")]
-        gptlist.sort()
+
         import ollama
         try:
-            default_modelollamaList = ollama.list()['models']
+            remoteOllamaServer = getattr(self.args, 'remoteOllamaServer', None)
+            if remoteOllamaServer:
+                client = ollama.Client(host=self.args.remoteOllamaServer)
+                default_modelollamaList = client.list()['models']
+            else:
+                default_modelollamaList = ollama.list()['models']
             for model in default_modelollamaList:
                 fullOllamaList.append(model['name'])
         except:
             fullOllamaList = []
-        return gptlist, fullOllamaList, claudeList
+        try:
+            import google.generativeai as genai
+            genai.configure(api_key=os.environ["GOOGLE_API_KEY"])
+            for m in genai.list_models():
+                if 'generateContent' in m.supported_generation_methods:
+                    googleList.append(m.name)
+        except:
+            googleList = []
+
+        return gptlist, fullOllamaList, claudeList, googleList
 
     def get_cli_input(self):
         """ aided by ChatGPT; uses platform library
@@ -331,6 +471,23 @@ class Standalone:
                 return input("Enter Question: ")
         else:
             return sys.stdin.read()
+
+    def agents(self, userInput):
+        from praisonai import PraisonAI
+        model = self.model
+        os.environ["OPENAI_MODEL_NAME"] = model
+        if model in self.sorted_gpt_models:
+            os.environ["OPENAI_API_BASE"] = "https://api.openai.com/v1/"
+        elif model in self.ollamaList:
+            os.environ["OPENAI_API_BASE"] = "http://localhost:11434/v1"
+            os.environ["OPENAI_API_KEY"] = "NA"
+
+        elif model in self.claudeList:
+            print("Claude is not supported in this mode")
+            sys.exit()
+        print("Starting PraisonAI...")
+        praison_ai = PraisonAI(auto=userInput, framework="autogen")
+        praison_ai.main()
 
 
 class Update:
@@ -426,6 +583,7 @@ class Setup:
         self.env_file = os.path.join(self.config_directory, ".env")
         self.gptlist = []
         self.fullOllamaList = []
+        self.googleList = []
         self.claudeList = ['claude-3-opus-20240229']
         load_dotenv(self.env_file)
         try:
@@ -433,6 +591,21 @@ class Setup:
             self.openaiapi_key = openaiapikey
         except:
             pass
+
+    def __ensure_env_file_created(self):
+        """        Ensure that the environment file is created.
+
+        Returns:
+            None
+
+        Raises:
+            OSError: If the environment file cannot be created.
+        """
+        print("Creating empty environment file...")
+        if not os.path.exists(self.env_file):
+            with open(self.env_file, "w") as f:
+                f.write("#No API key set\n")
+        print("Environment file created.")
 
     def update_shconfigs(self):
         bootstrap_file = os.path.join(
@@ -500,6 +673,31 @@ class Setup:
             with open(self.env_file, "w") as f:
                 f.write(f"CLAUDE_API_KEY={claude_key}\n")
 
+    def google_key(self, google_key):
+        """        Set the Google API key in the environment file.
+
+        Args:
+            google_key (str): The API key to be set.
+
+        Returns:
+            None
+
+        Raises:
+            OSError: If the environment file does not exist or cannot be accessed.
+        """
+        google_key = google_key.strip()
+        if os.path.exists(self.env_file) and google_key:
+            with open(self.env_file, "r") as f:
+                lines = f.readlines()
+            with open(self.env_file, "w") as f:
+                for line in lines:
+                    if "GOOGLE_API_KEY" not in line:
+                        f.write(line)
+                f.write(f"GOOGLE_API_KEY={google_key}\n")
+        elif google_key:
+            with open(self.env_file, "w") as f:
+                f.write(f"GOOGLE_API_KEY={google_key}\n")
+
     def youtube_key(self, youtube_key):
         """        Set the YouTube API key in the environment file.
 
@@ -534,8 +732,8 @@ class Setup:
         model = model.strip()
         env = os.path.expanduser("~/.config/fabric/.env")
         standalone = Standalone(args=[], pattern="")
-        gpt, ollama, claude = standalone.fetch_available_models()
-        allmodels = gpt + ollama + claude
+        gpt, ollama, claude, google = standalone.fetch_available_models()
+        allmodels = gpt + ollama + claude + google
         if model not in allmodels:
             print(
                 f"Error: {model} is not a valid model. Please run fabric --listmodels to see the available models.")
@@ -595,11 +793,15 @@ class Setup:
         print("Please enter your claude API key. If you do not have one, or if you have already entered it, press enter.\n")
         claudekey = input()
         self.claude_key(claudekey)
+        print("Please enter your Google API key. If you do not have one, or if you have already entered it, press enter.\n")
+        googlekey = input()
+        self.google_key(googlekey)
         print("Please enter your YouTube API key. If you do not have one, or if you have already entered it, press enter.\n")
         youtubekey = input()
         self.youtube_key(youtubekey)
         self.patterns()
         self.update_shconfigs()
+        self.__ensure_env_file_created()
 
 
 class Transcribe:
@@ -659,3 +861,37 @@ class AgentSetup:
             else:
                 # If it does not end with a newline, add one before the new entries
                 f.write(f"\n{browserless_entry}\n{serper_entry}\n")
+
+
+def run_electron_app():
+    # Step 1: Set CWD to the directory of the script
+    os.chdir(os.path.dirname(os.path.realpath(__file__)))
+
+    # Step 2: Check for the './installer/client/gui' directory
+    target_dir = '../gui'
+    if not os.path.exists(target_dir):
+        print(f"""The directory {
+              target_dir} does not exist. Please check the path and try again.""")
+        return
+
+    # Step 3: Check for NPM installation
+    try:
+        subprocess.run(['npm', '--version'], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except subprocess.CalledProcessError:
+        print("NPM is not installed. Please install NPM and try again.")
+        return
+
+    # If this point is reached, NPM is installed.
+    # Step 4: Change directory to the Electron app's directory
+    os.chdir(target_dir)
+
+    # Step 5: Run 'npm install' and 'npm start'
+    try:
+        print("Running 'npm install'... This might take a few minutes.")
+        subprocess.run(['npm', 'install'], check=True)
+        print(
+            "'npm install' completed successfully. Starting the Electron app with 'npm start'...")
+        subprocess.run(['npm', 'start'], check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"An error occurred while executing NPM commands: {e}")
